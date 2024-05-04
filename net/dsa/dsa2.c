@@ -386,6 +386,24 @@ static int dsa_tree_setup_default_cpu(struct dsa_switch_tree *dst)
 	return 0;
 }
 
+static struct dsa_port *
+dsa_switch_preferred_default_local_cpu_port(struct dsa_switch *ds)
+{
+	struct dsa_port *cpu_dp;
+
+	if (!ds->ops->preferred_default_local_cpu_port)
+		return NULL;
+
+	cpu_dp = ds->ops->preferred_default_local_cpu_port(ds);
+	if (!cpu_dp)
+		return NULL;
+
+	if (WARN_ON(!dsa_port_is_cpu(cpu_dp) || cpu_dp->ds != ds))
+		return NULL;
+
+	return cpu_dp;
+}
+
 /* Perform initial assignment of CPU ports to user ports and DSA links in the
  * fabric, giving preference to CPU ports local to each switch. Default to
  * using the first CPU port in the switch tree if the port does not have a CPU
@@ -393,10 +411,14 @@ static int dsa_tree_setup_default_cpu(struct dsa_switch_tree *dst)
  */
 static int dsa_tree_setup_cpu_ports(struct dsa_switch_tree *dst)
 {
-	struct dsa_port *cpu_dp, *dp;
+	struct dsa_port *preferred_cpu_dp, *cpu_dp, *dp;
 
 	list_for_each_entry(cpu_dp, &dst->ports, list) {
 		if (!dsa_port_is_cpu(cpu_dp))
+			continue;
+
+		preferred_cpu_dp = dsa_switch_preferred_default_local_cpu_port(cpu_dp->ds);
+		if (preferred_cpu_dp && preferred_cpu_dp != cpu_dp)
 			continue;
 
 		list_for_each_entry(dp, &dst->ports, list) {
@@ -805,7 +827,7 @@ static int dsa_switch_setup_tag_protocol(struct dsa_switch *ds)
 	int port, err;
 
 	if (tag_ops->proto == dst->default_proto)
-		goto connect;
+		return 0;
 
 	for (port = 0; port < ds->num_ports; port++) {
 		if (!dsa_is_cpu_port(ds, port))
@@ -821,30 +843,7 @@ static int dsa_switch_setup_tag_protocol(struct dsa_switch *ds)
 		}
 	}
 
-connect:
-	if (tag_ops->connect) {
-		err = tag_ops->connect(ds);
-		if (err)
-			return err;
-	}
-
-	if (ds->ops->connect_tag_protocol) {
-		err = ds->ops->connect_tag_protocol(ds, tag_ops->proto);
-		if (err) {
-			dev_err(ds->dev,
-				"Unable to connect to tag protocol \"%s\": %pe\n",
-				tag_ops->name, ERR_PTR(err));
-			goto disconnect;
-		}
-	}
-
 	return 0;
-
-disconnect:
-	if (tag_ops->disconnect)
-		tag_ops->disconnect(ds);
-
-	return err;
 }
 
 static int dsa_switch_setup(struct dsa_switch *ds)
@@ -1155,37 +1154,6 @@ static void dsa_tree_teardown(struct dsa_switch_tree *dst)
 	dst->setup = false;
 }
 
-static int dsa_tree_bind_tag_proto(struct dsa_switch_tree *dst,
-				   const struct dsa_device_ops *tag_ops)
-{
-	const struct dsa_device_ops *old_tag_ops = dst->tag_ops;
-	struct dsa_notifier_tag_proto_info info;
-	int err;
-
-	dst->tag_ops = tag_ops;
-
-	/* Notify the switches from this tree about the connection
-	 * to the new tagger
-	 */
-	info.tag_ops = tag_ops;
-	err = dsa_tree_notify(dst, DSA_NOTIFIER_TAG_PROTO_CONNECT, &info);
-	if (err && err != -EOPNOTSUPP)
-		goto out_disconnect;
-
-	/* Notify the old tagger about the disconnection from this tree */
-	info.tag_ops = old_tag_ops;
-	dsa_tree_notify(dst, DSA_NOTIFIER_TAG_PROTO_DISCONNECT, &info);
-
-	return 0;
-
-out_disconnect:
-	info.tag_ops = tag_ops;
-	dsa_tree_notify(dst, DSA_NOTIFIER_TAG_PROTO_DISCONNECT, &info);
-	dst->tag_ops = old_tag_ops;
-
-	return err;
-}
-
 /* Since the dsa/tagging sysfs device attribute is per master, the assumption
  * is that all DSA switches within a tree share the same tagger, otherwise
  * they would have formed disjoint trees (different "dsa,member" values).
@@ -1218,15 +1186,12 @@ int dsa_tree_change_tag_proto(struct dsa_switch_tree *dst,
 			goto out_unlock;
 	}
 
-	/* Notify the tag protocol change */
 	info.tag_ops = tag_ops;
 	err = dsa_tree_notify(dst, DSA_NOTIFIER_TAG_PROTO, &info);
 	if (err)
-		return err;
-
-	err = dsa_tree_bind_tag_proto(dst, tag_ops);
-	if (err)
 		goto out_unwind_tagger;
+
+	dst->tag_ops = tag_ops;
 
 	rtnl_unlock();
 
